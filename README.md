@@ -29,6 +29,16 @@ implemented against `onnxruntime.InferenceSession`, but **no trained
 model files ship with this repository** -- see
 [Model Files](#model-files) below.
 
+**This has been validated with unit and integration tests against
+synthetic CSI data, but not yet against real ESP32 hardware** -- the
+maintainer doesn't currently have a device to test with. If you try it
+on real hardware, bug reports (especially anything in
+`SerialCSISource`/the ESP32-CSI-Tool line parsing, and the fixed
+thresholds in the statistical baselines) are genuinely the most useful
+thing you can contribute right now. Please open an issue with your
+board model, firmware version, and, if possible, a short capture file
+reproducing the problem.
+
 ## Install
 
 ```bash
@@ -46,7 +56,7 @@ pip install -e ".[viz]"   # matplotlib
 
 ## Quickstart
 
-See [`examples/presence_demo.py`](examples/presence_demo.py) for a
+See [`examples/presence_demo.py`](https://github.com/collabray/wisense/blob/main/examples/presence_demo.py) for a
 complete, runnable, **hardware-free** walkthrough (it replays a small
 synthetic capture bundled in `tests/fixtures/`). Run it with:
 
@@ -55,14 +65,14 @@ python examples/presence_demo.py
 ```
 
 For a real device, see
-[`examples/live_esp32_demo.py`](examples/live_esp32_demo.py), which
+[`examples/live_esp32_demo.py`](https://github.com/collabray/wisense/blob/main/examples/live_esp32_demo.py), which
 **requires a physical ESP32** flashed with
 [ESP32-CSI-Tool](https://github.com/StevenMHernandez/ESP32-CSI-Tool)-compatible
 firmware, connected over USB serial.
 
 The full walkthrough -- connecting, calibrating, every feature module,
-event callbacks -- is in [`docs/usage.md`](docs/usage.md). API
-reference is in [`docs/api.md`](docs/api.md).
+event callbacks -- is in [`docs/usage.md`](https://github.com/collabray/wisense/blob/main/docs/usage.md). API
+reference is in [`docs/api.md`](https://github.com/collabray/wisense/blob/main/docs/api.md).
 
 ## Feature list
 
@@ -156,6 +166,10 @@ default, not a validated accuracy claim, and calibrate
 (`wisense.core.calibrate`) for your specific environment before
 relying on it.
 
+See [ROADMAP.md](https://github.com/collabray/wisense/blob/main/ROADMAP.md)
+for what's intentionally scoped out of this release and not yet
+implemented.
+
 ## Development
 
 ```bash
@@ -175,4 +189,4 @@ logging.getLogger("wisense").setLevel(logging.INFO)
 
 ## License
 
-MIT -- see [LICENSE](LICENSE).
+MIT -- see [LICENSE](https://github.com/collabray/wisense/blob/main/LICENSE).
