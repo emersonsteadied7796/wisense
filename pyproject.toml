@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "wisense"
-version = "0.1.0"
+version = "0.1.2"
 description = "WiFi CSI human sensing (presence, falls, breathing, activity, occupancy) for Python -- no camera, no cloud."
 readme = "README.md"
 license = { text = "MIT" }
