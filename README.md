@@ -156,23 +156,6 @@ default, not a validated accuracy claim, and calibrate
 (`wisense.core.calibrate`) for your specific environment before
 relying on it.
 
-## Not Yet Implemented
-
-Scoped out of this v0.1.0 pass, listed here rather than left as silent
-stubs:
-
-* **Multi-sensor fusion** (combining two or more ESP32 nodes for
-  larger-space coverage) -- mentioned in the project's Phase 3 roadmap,
-  not implemented.
-* **Home Assistant integration package** (`wisense-hass`) -- Phase 4
-  roadmap item, not implemented.
-* **Pretrained model zoo** -- see [Model Files](#model-files) above.
-* **Non-ESP32 capture backends** -- only ESP32-CSI-Tool-compatible
-  serial capture has real parsing code; other CSI-capable chipsets
-  (e.g. Linux `nexmon`/Intel 5300-class tooling) are not implemented,
-  since this repository has no way to validate against them without
-  the hardware.
-
 ## Development
 
 ```bash
