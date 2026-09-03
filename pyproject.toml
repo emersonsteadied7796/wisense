@@ -44,10 +44,10 @@ viz = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/wisense-project/wisense"
-Documentation = "https://github.com/wisense-project/wisense/blob/main/docs/usage.md"
-Issues = "https://github.com/wisense-project/wisense/issues"
-Changelog = "https://github.com/wisense-project/wisense/blob/main/CHANGELOG.md"
+Homepage = "https://github.com/collabray/wisense"
+Documentation = "https://github.com/collabray/wisense/blob/main/docs/usage.md"
+Issues = "https://github.com/collabray/wisense/issues"
+Changelog = "https://github.com/collabray/wisense/blob/main/CHANGELOG.md"
 
 [tool.setuptools.packages.find]
 include = ["wisense*"]
