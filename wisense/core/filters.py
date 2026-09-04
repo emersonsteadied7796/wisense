@@ -1,647 +1,410 @@
-"""Device connection layer.
+"""Signal conditioning utilities operating on CSI amplitude/phase data.
 
-Defines the :class:`CSIFrame` data container and the :class:`CSISource`
-abstract base class, plus three concrete sources:
+Every function here is a real, documented signal-processing routine
+(not a black box) so callers can audit exactly what happens to their
+data:
 
-* :class:`SerialCSISource` -- reads CSI over a serial port from an
-  ESP32 running ESP32-CSI-Tool-compatible firmware
-  (https://github.com/StevenMHernandez/ESP32-CSI-Tool). The wire format
-  parsed here is that project's documented CSV output line, described
-  in detail in the ``_parse_esp32_csi_tool_line`` docstring below.
-* :class:`NetworkCSISource` -- reads a CSI stream over UDP or TCP using
-  a small newline-delimited JSON protocol that WiSense itself defines
-  (there is no single industry-standard network CSI wire format, so we
-  do not pretend one exists -- see the class docstring for the schema).
-* :class:`FileCSISource` -- replays a previously recorded capture from
-  disk, using the WiSense CSV capture format documented in the class
-  docstring. Useful for tests, demos, and offline development without
-  hardware.
-
-All three implement the same ``connect`` / ``disconnect`` / `read_frame`
-/ ``stream`` / context-manager interface, so downstream code (buffers,
-detectors, calibration) never needs to know which one it's talking to.
+* :func:`amplitude_phase` -- extracts amplitude/phase from raw complex
+  CSI (real + imaginary components), for sources that hand back raw IQ
+  data rather than pre-split amplitude/phase.
+* :func:`hampel_filter` -- outlier-robust denoising via the Hampel
+  identifier (median absolute deviation over a sliding window).
+* :func:`moving_average_filter` -- simple causal or centered moving
+  average low-pass filter.
+* :func:`select_subcarriers` -- reduces a ``(frames, subcarriers)``
+  amplitude matrix to a smaller, more informative set of subcarriers
+  (or a single aggregate series) for downstream detectors.
+* :func:`filter_majority_subcarrier_count` -- drops frames whose
+  subcarrier count doesn't match the majority (e.g. a stray
+  mixed-bandwidth packet), so real hardware streams don't crash
+  :func:`frames_to_amplitude_matrix`'s strict shape check.
+* :func:`normalize_frame_amplitude` -- partially compensates for
+  per-packet AGC (automatic gain control) gain changes by rescaling
+  each frame to a common magnitude before variance-based detection.
 """
 
 from __future__ import annotations
 
-import abc
-import json
-import logging
-import socket
-import time
-from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Iterator, Optional, Union
+from typing import List, Literal, Optional, Sequence, Tuple
 
 import numpy as np
+from scipy.signal import butter, filtfilt
 
-from wisense.exceptions import ConnectionError as WiSenseConnectionError
-from wisense.exceptions import FrameParseError
-
-logger = logging.getLogger("wisense.core.connection")
+from wisense.core.connection import CSIFrame
 
 
-@dataclass
-class CSIFrame:
-    """A single CSI measurement.
+def amplitude_phase(real: np.ndarray, imag: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """Compute amplitude and (unwrapped) phase from raw complex CSI
+    components.
 
-    Attributes
+    ``amplitude = sqrt(real**2 + imag**2)``, ``phase = atan2(imag, real)``,
+    with phase unwrapped along the last axis (subcarrier axis) using
+    ``numpy.unwrap`` to remove artificial :math:`2\\pi` jumps between
+    adjacent subcarriers, which is standard practice before using phase
+    for sensing (raw wrapped phase is not directly usable).
+
+    Parameters
     ----------
-    timestamp:
-        Unix epoch seconds (float) at which the frame was captured or
-        received. For replayed files this is the timestamp stored in
-        the file, not wall-clock replay time.
-    amplitude:
-        1-D array of per-subcarrier amplitude, shape ``(n_subcarriers,)``.
-    phase:
-        1-D array of per-subcarrier phase in radians, shape
-        ``(n_subcarriers,)``. May be ``None`` if the source cannot
-        provide phase (some cheap capture pipelines only expose
-        amplitude).
+    real, imag:
+        Arrays of identical shape, e.g. ``(n_subcarriers,)`` for a
+        single frame or ``(n_frames, n_subcarriers)`` for a window.
 
-        **No statistical-baseline detector in this library currently
-        reads this field.** Every detection module (presence, fall,
-        activity, breathing, people) operates on amplitude only. This
-        is deliberate, not an oversight: commodity WiFi radios like the
-        ESP32 suffer from carrier/sampling frequency offset and packet
-        detection delay severe enough that raw per-packet phase rotates
-        essentially randomly across ``[-pi, +pi]`` without proper
-        sanitization (linear unwrapping alone, as done in
-        :func:`wisense.core.filters.amplitude_phase`, is not
-        sufficient -- real phase-based sensing needs per-link
-        calibration or a multi-antenna reference to cancel these
-        offsets, which this library does not implement). ``phase`` is
-        still parsed and exposed here for advanced users who want to
-        implement their own phase-based processing, or as an input
-        feature to a custom-trained ONNX model, but treat it as raw,
-        uncalibrated data -- not something safe to threshold on
-        directly the way amplitude is.
-    rssi:
-        Received signal strength indicator in dBm, if the source
-        reports one. ``None`` if unavailable.
-    mac:
-        Source MAC address string, if known. ``None`` if unavailable.
+    Returns
+    -------
+    (amplitude, phase): tuple of arrays with the same shape as the input.
     """
-
-    timestamp: float
-    amplitude: np.ndarray
-    phase: Optional[np.ndarray] = None
-    rssi: Optional[float] = None
-    mac: Optional[str] = None
-
-    def __post_init__(self) -> None:
-        self.amplitude = np.asarray(self.amplitude, dtype=np.float64)
-        if self.phase is not None:
-            self.phase = np.asarray(self.phase, dtype=np.float64)
-            if self.phase.shape != self.amplitude.shape:
-                raise FrameParseError(
-                    f"amplitude shape {self.amplitude.shape} does not match "
-                    f"phase shape {self.phase.shape}"
-                )
-
-    @property
-    def n_subcarriers(self) -> int:
-        return int(self.amplitude.shape[0])
+    real = np.asarray(real, dtype=np.float64)
+    imag = np.asarray(imag, dtype=np.float64)
+    if real.shape != imag.shape:
+        raise ValueError(f"real shape {real.shape} != imag shape {imag.shape}")
+    amplitude = np.sqrt(real**2 + imag**2)
+    phase = np.unwrap(np.arctan2(imag, real), axis=-1)
+    return amplitude, phase
 
 
-class CSISource(abc.ABC):
-    """Abstract base class for anything that produces a stream of
-    :class:`CSIFrame` objects.
+def hampel_filter(series: np.ndarray, window_size: int = 5, n_sigmas: float = 3.0) -> np.ndarray:
+    """Apply a Hampel identifier/filter to a 1-D series.
 
-    Concrete subclasses must implement :meth:`connect`,
-    :meth:`disconnect`, and :meth:`read_frame`. :meth:`stream` and the
-    context-manager protocol (``with source: ...``) are provided here
-    in terms of those three primitives, so subclasses get them for
-    free.
+    For each point, computes the median and median absolute deviation
+    (MAD) of a symmetric window of ``window_size`` samples centered on
+    it. If the point deviates from the window median by more than
+    ``n_sigmas * 1.4826 * MAD`` (the ``1.4826`` factor makes MAD a
+    consistent estimator of the standard deviation for normally
+    distributed data), it is replaced with the window median. This is a
+    standard, well-documented outlier-robust denoising technique
+    (Hampel, 1974; commonly used for CSI/RSSI denoising in WiFi sensing
+    pipelines because it removes spikes without smoothing out genuine
+    step changes the way a plain moving average would).
+
+    Parameters
+    ----------
+    series: 1-D array of samples (e.g. one subcarrier's amplitude over time).
+    window_size: half-window radius in samples (full window = 2*window_size+1).
+    n_sigmas: outlier threshold in (MAD-estimated) standard deviations.
+
+    Returns
+    -------
+    Filtered copy of ``series`` with outliers replaced by local medians.
     """
+    series = np.asarray(series, dtype=np.float64).copy()
+    n = series.shape[0]
+    if n == 0:
+        return series
+    if window_size < 1:
+        raise ValueError("window_size must be >= 1")
 
-    def __init__(self) -> None:
-        self._connected = False
-
-    @property
-    def is_connected(self) -> bool:
-        return self._connected
-
-    @abc.abstractmethod
-    def connect(self) -> None:
-        """Open the underlying connection (serial port, socket, or
-        file). Must set ``self._connected = True`` on success and raise
-        :class:`wisense.exceptions.ConnectionError` on failure."""
-        raise NotImplementedError
-
-    @abc.abstractmethod
-    def disconnect(self) -> None:
-        """Close the underlying connection. Must be safe to call
-        multiple times and safe to call even if ``connect`` was never
-        called."""
-        raise NotImplementedError
-
-    @abc.abstractmethod
-    def read_frame(self) -> Optional[CSIFrame]:
-        """Read and return a single :class:`CSIFrame`, or ``None`` if no
-        more frames are available (end of file / stream closed).
-
-        Raises :class:`wisense.exceptions.ConnectionError` if called
-        before :meth:`connect`, and
-        :class:`wisense.exceptions.FrameParseError` if a malformed
-        packet is encountered and cannot be recovered from.
-        """
-        raise NotImplementedError
-
-    def stream(self) -> Iterator[CSIFrame]:
-        """Yield frames one at a time until :meth:`read_frame` returns
-        ``None``. Does not itself call :meth:`connect`/:meth:`disconnect`;
-        callers should use the source as a context manager or call
-        those explicitly."""
-        while True:
-            frame = self.read_frame()
-            if frame is None:
-                return
-            yield frame
-
-    def __enter__(self) -> "CSISource":
-        self.connect()
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
-        self.disconnect()
-
-    def _require_connected(self) -> None:
-        if not self._connected:
-            raise WiSenseConnectionError(
-                f"{type(self).__name__} is not connected; call connect() "
-                "first or use it as a context manager (`with source:`)."
-            )
+    k = 1.4826  # scale factor from MAD to std-dev for a Gaussian
+    for i in range(n):
+        lo = max(0, i - window_size)
+        hi = min(n, i + window_size + 1)
+        window = series[lo:hi]
+        med = np.median(window)
+        mad = np.median(np.abs(window - med))
+        threshold = n_sigmas * k * mad
+        if threshold == 0:
+            # Degenerate window: every neighbour shares exactly the
+            # same value, so the window's MAD is zero and *any*
+            # deviation from that shared value is, by definition, an
+            # outlier relative to this window.
+            if series[i] != med:
+                series[i] = med
+            continue
+        if np.abs(series[i] - med) > threshold:
+            series[i] = med
+    return series
 
 
-class SerialCSISource(CSISource):
-    """Reads CSI frames over a serial port from an ESP32 running
-    ESP32-CSI-Tool-compatible firmware.
+def moving_average_filter(
+    series: np.ndarray, window_size: int = 5, mode: Literal["causal", "centered"] = "centered"
+) -> np.ndarray:
+    """Apply a simple moving-average low-pass filter to a 1-D series.
 
-    Wire format
-    -----------
-    ESP32-CSI-Tool (https://github.com/StevenMHernandez/ESP32-CSI-Tool)
-    writes one CSV line per packet to the serial port, of the form::
+    Parameters
+    ----------
+    series: 1-D array of samples.
+    window_size: number of samples averaged together (>= 1).
+    mode:
+        ``"centered"`` averages ``window_size`` samples centered on
+        each point (introduces no group-delay but is non-causal, i.e.
+        needs future samples -- fine for offline/batch processing).
+        ``"causal"`` averages the current sample and the
+        ``window_size - 1`` preceding it (usable in real-time streaming,
+        introduces ``(window_size-1)/2`` samples of delay).
 
-        CSI_DATA,<type>,<mac>,<rssi>,<rate>,<sig_mode>,<mcs>,<bandwidth>,
-        <smoothing>,<not_sounding>,<aggregation>,<stbc>,<fec_coding>,
-        <sgi>,<noise_floor>,<ampdu_cnt>,<channel>,<secondary_channel>,
-        <local_timestamp>,<ant>,<sig_len>,<rx_state>,<len>,"[<csi_int8_array>]"
-
-    The final field is a bracketed, space-separated list of signed
-    8-bit integers, alternating ``imaginary, real`` for each subcarrier,
-    i.e. ``len(csi_int8_array) == 2 * n_subcarriers``. This class
-    parses exactly that layout. Lines that do not start with
-    ``CSI_DATA`` (e.g. firmware log/debug lines interleaved on the same
-    serial port) are skipped rather than raising, since that is normal,
-    expected traffic on this link.
-
-    Multiple transmitters on the same link
-    ---------------------------------------
-    An ESP32 running in CSI-sniffing mode can report packets from
-    *every* nearby WiFi transmitter it overhears -- your router, other
-    people's routers, phones, IoT devices -- not just one. Mixing CSI
-    from different transmitters into one time series is meaningless:
-    each has its own distance, transmit power, and antenna geometry, so
-    amplitude "variance" between two frames from two different
-    transmitters reflects who's transmitting, not whether someone moved.
-    Pass ``target_mac`` to keep only frames from one specific
-    transmitter (e.g. your own router's BSSID) and silently discard the
-    rest.
-
-    Hardware timestamps
-    --------------------
-    The firmware reports ``local_timestamp`` as microseconds since the
-    ESP32's own boot, not wall-clock time. USB-to-UART bridges commonly
-    deliver serial data in bursts (they buffer for their own USB polling
-    interval rather than delivering byte-by-byte), so using
-    ``time.time()`` at Python receipt time for every frame introduces
-    burst jitter that corrupts time-sensitive analysis like the FFT in
-    :func:`wisense.vitals.breathing.estimate_breathing_rate`. To avoid
-    this, this class establishes a wall-clock offset from the *first*
-    frame it sees (``offset = time.time() - local_timestamp_seconds``)
-    and applies that same offset to every subsequent frame's hardware
-    timestamp, so frame-to-frame spacing reflects the firmware's own
-    microsecond-accurate clock rather than USB delivery jitter.
-
-    Requires ``pyserial`` (``pip install wisense`` pulls it in as a core
-    dependency since it is required for this source).
+    Returns
+    -------
+    Filtered copy of ``series``, same length as input. Edge samples use
+    a shorter (available-data-only) window rather than zero-padding, to
+    avoid biasing the filtered signal toward zero at the boundaries.
     """
+    series = np.asarray(series, dtype=np.float64)
+    n = series.shape[0]
+    if window_size < 1:
+        raise ValueError("window_size must be >= 1")
+    if n == 0:
+        return series.copy()
 
-    def __init__(
-        self,
-        port: str,
-        baudrate: int = 921600,
-        timeout: float = 2.0,
-        target_mac: Optional[str] = None,
-    ) -> None:
-        super().__init__()
-        self.port = port
-        self.baudrate = baudrate
-        self.timeout = timeout
-        self.target_mac = target_mac.lower() if target_mac else None
-        self._serial = None  # type: ignore[assignment]
-        self._time_offset: Optional[float] = None
+    out = np.empty_like(series)
+    if mode == "centered":
+        half = window_size // 2
+        for i in range(n):
+            lo = max(0, i - half)
+            hi = min(n, i + half + 1)
+            out[i] = series[lo:hi].mean()
+    elif mode == "causal":
+        for i in range(n):
+            lo = max(0, i - window_size + 1)
+            out[i] = series[lo : i + 1].mean()
+    else:
+        raise ValueError(f"mode must be 'causal' or 'centered', got {mode!r}")
+    return out
 
-    def connect(self) -> None:
-        try:
-            import serial  # pyserial
-        except ImportError as exc:  # pragma: no cover - exercised only
-            raise WiSenseConnectionError(
-                "pyserial is required for SerialCSISource but is not "
-                "installed. Install it with `pip install pyserial`."
-            ) from exc
-        try:
-            self._serial = serial.Serial(
-                port=self.port, baudrate=self.baudrate, timeout=self.timeout
-            )
-        except Exception as exc:  # serial.SerialException, OSError, etc.
-            raise WiSenseConnectionError(
-                f"Failed to open serial port {self.port!r}: {exc}"
-            ) from exc
-        self._connected = True
-        logger.info("Connected to ESP32 CSI source on %s @ %d baud", self.port, self.baudrate)
 
-    def disconnect(self) -> None:
-        if self._serial is not None:
-            try:
-                self._serial.close()
-            finally:
-                self._serial = None
-        self._connected = False
+def butterworth_lowpass_filter(
+    series: np.ndarray, cutoff_hz: float, sample_rate_hz: float, order: int = 4
+) -> np.ndarray:
+    """Apply a zero-phase Butterworth low-pass filter to a 1-D series.
 
-    def read_frame(self) -> Optional[CSIFrame]:
-        self._require_connected()
-        assert self._serial is not None
-        while True:
-            raw = self._serial.readline()
-            if not raw:
-                # Timeout with no data -- treat as "no frame right now",
-                # not end of stream, since the device may still be alive.
-                return None
-            try:
-                line = raw.decode("utf-8", errors="strict").strip()
-            except UnicodeDecodeError:
-                logger.debug("Discarding non-UTF-8 serial line")
-                continue
-            if not line.startswith("CSI_DATA"):
-                # Firmware debug/log output sharing the same UART.
-                continue
-            try:
-                frame = self._parse_esp32_csi_tool_line(line)
-            except FrameParseError as exc:
-                logger.warning("Discarding malformed CSI_DATA line: %s", exc)
-                continue
-            if self.target_mac is not None and (frame.mac is None or frame.mac.lower() != self.target_mac):
-                # Frame from a different transmitter than the one we've
-                # been asked to track -- see class docstring on why
-                # mixing these is meaningless for sensing.
-                continue
-            return frame
+    Uses ``scipy.signal.butter`` to design the filter and
+    ``scipy.signal.filtfilt`` to apply it forward and backward, which
+    cancels the filter's phase response (no time-shift is introduced --
+    important for downstream timing-sensitive analysis like fall-event
+    timestamping). This is the standard technique cited whenever "a
+    Butterworth low-pass" is used for CSI denoising in the WiFi-sensing
+    literature.
 
-    def _parse_esp32_csi_tool_line(self, line: str) -> CSIFrame:
-        """Parse one ``CSI_DATA,...`` line as emitted by ESP32-CSI-Tool.
+    Parameters
+    ----------
+    series: 1-D array of samples.
+    cutoff_hz: -3 dB cutoff frequency in Hz.
+    sample_rate_hz: sampling rate ``series`` was captured at, in Hz.
+    order: filter order (higher = steeper rolloff, more ringing risk).
 
-        See the class docstring for the field layout. Raises
-        :class:`FrameParseError` if the line does not have the expected
-        number of comma-separated fields or the CSI array cannot be
-        parsed as an even-length list of int8 values.
+    Returns
+    -------
+    Filtered copy of ``series``, same length as input.
 
-        Instance method (not static) because it maintains
-        ``self._time_offset`` to translate the firmware's
-        boot-relative microsecond clock into wall-clock time -- see the
-        "Hardware timestamps" section of the class docstring.
-        """
-        # The CSI array field is itself comma-free (space separated,
-        # bracket delimited), but it may contain the delimiter used by
-        # some firmware builds inside quotes, so split defensively on
-        # the bracket rather than assuming a fixed comma count for that
-        # final field.
-        bracket_start = line.find("[")
-        bracket_end = line.rfind("]")
-        if bracket_start == -1 or bracket_end == -1 or bracket_end < bracket_start:
-            raise FrameParseError(f"no CSI array found in line: {line!r}")
-
-        header = line[:bracket_start].rstrip(', "')
-        csi_blob = line[bracket_start + 1 : bracket_end]
-
-        fields = header.split(",")
-        # CSI_DATA,type,mac,rssi,rate,sig_mode,mcs,bandwidth,smoothing,
-        # not_sounding,aggregation,stbc,fec_coding,sgi,noise_floor,
-        # ampdu_cnt,channel,secondary_channel,local_timestamp,ant,
-        # sig_len,rx_state,len  == 23 fields before the CSI array
-        if len(fields) < 23:
-            raise FrameParseError(
-                f"expected >=23 header fields before CSI array, got {len(fields)}"
-            )
-
-        try:
-            mac = fields[2].strip()
-            rssi = float(fields[3])
-            local_timestamp_us = float(fields[18])
-        except (ValueError, IndexError) as exc:
-            raise FrameParseError(f"could not parse header fields: {exc}") from exc
-
-        try:
-            raw_values = [int(v) for v in csi_blob.replace(",", " ").split()]
-        except ValueError as exc:
-            raise FrameParseError(f"could not parse CSI int8 array: {exc}") from exc
-
-        if len(raw_values) == 0 or len(raw_values) % 2 != 0:
-            raise FrameParseError(
-                f"CSI array must have an even number of int8 values "
-                f"(imag,real pairs), got {len(raw_values)}"
-            )
-
-        arr = np.asarray(raw_values, dtype=np.float64).reshape(-1, 2)
-        imag, real = arr[:, 0], arr[:, 1]
-        amplitude = np.sqrt(real**2 + imag**2)
-        phase = np.arctan2(imag, real)
-
-        # local_timestamp from the firmware is microseconds since boot,
-        # not wall-clock time. Establish a wall-clock offset from the
-        # first frame seen, then apply that same offset to every
-        # subsequent frame's hardware timestamp -- this preserves the
-        # firmware's own microsecond-accurate inter-frame spacing
-        # instead of using USB-burst-jittery Python receipt time. See
-        # the "Hardware timestamps" section of the class docstring.
-        local_timestamp_s = local_timestamp_us / 1_000_000.0
-        if self._time_offset is None:
-            self._time_offset = time.time() - local_timestamp_s
-        timestamp = self._time_offset + local_timestamp_s
-
-        return CSIFrame(
-            timestamp=timestamp,
-            amplitude=amplitude,
-            phase=phase,
-            rssi=rssi,
-            mac=mac,
+    Raises
+    ------
+    ValueError
+        If ``cutoff_hz`` is not strictly between 0 and the Nyquist
+        frequency (``sample_rate_hz / 2``), or if there are too few
+        samples for ``filtfilt``'s default padding at this ``order``.
+    """
+    series = np.asarray(series, dtype=np.float64)
+    nyquist = sample_rate_hz / 2.0
+    if not (0 < cutoff_hz < nyquist):
+        raise ValueError(f"cutoff_hz must be in (0, {nyquist}) given sample_rate_hz={sample_rate_hz}")
+    min_len = 3 * (order + 1)
+    if series.shape[0] <= min_len:
+        raise ValueError(
+            f"series too short ({series.shape[0]} samples) for a stable "
+            f"order-{order} filtfilt application; need > {min_len} samples"
         )
+    b, a = butter(order, cutoff_hz / nyquist, btype="low")
+    return filtfilt(b, a, series)
 
 
-class NetworkCSISource(CSISource):
-    """Reads a CSI stream over UDP or TCP.
+def select_subcarriers(
+    amplitude_matrix: np.ndarray,
+    method: Literal["variance_topk", "mean", "index"] = "variance_topk",
+    top_k: int = 10,
+    indices: Optional[Sequence[int]] = None,
+) -> np.ndarray:
+    """Reduce a ``(n_frames, n_subcarriers)`` amplitude matrix to a
+    smaller/aggregated representation for downstream detectors.
 
-    Wire protocol
-    --------------
-    There is no universal standard for streaming CSI over a network, so
-    WiSense defines a minimal one: newline-delimited JSON, one object
-    per frame::
+    Parameters
+    ----------
+    amplitude_matrix: shape ``(n_frames, n_subcarriers)``.
+    method:
+        * ``"variance_topk"`` -- selects the ``top_k`` subcarriers with
+          the highest temporal variance (the subcarriers most sensitive
+          to motion/multipath change, and thus most informative for
+          presence/fall/activity sensing -- a standard heuristic in the
+          WiFi-sensing literature for cutting a full subcarrier set down
+          to the ones worth processing).
+        * ``"mean"`` -- collapses all subcarriers to their per-frame
+          mean, returning shape ``(n_frames, 1)``.
+        * ``"index"`` -- selects the explicit ``indices`` given.
 
-        {"t": 1717000000.123, "amp": [1.0, 2.3, ...], "phase": [0.1, ...], "rssi": -42, "mac": "aa:bb:cc:dd:ee:ff"}
-
-    ``t`` (float, unix seconds) and ``amp`` (list of floats) are
-    required. ``phase``, ``rssi``, and ``mac`` are optional. Any
-    process bridging a real capture pipeline (e.g. a Linux host running
-    a CSI-capable driver) to the network need only emit lines in this
-    format on the chosen UDP/TCP port.
-
-    For UDP, each datagram is expected to contain exactly one JSON
-    object. For TCP, objects are newline-delimited on a persistent
-    stream connection.
+    Returns
+    -------
+    Array of shape ``(n_frames, k)`` where ``k`` depends on the method.
     """
-
-    def __init__(
-        self,
-        host: str,
-        port: int,
-        protocol: str = "udp",
-        timeout: float = 2.0,
-        recv_buffer_size: int = 65536,
-    ) -> None:
-        super().__init__()
-        protocol = protocol.lower()
-        if protocol not in ("udp", "tcp"):
-            raise ValueError(f"protocol must be 'udp' or 'tcp', got {protocol!r}")
-        self.host = host
-        self.port = port
-        self.protocol = protocol
-        self.timeout = timeout
-        self.recv_buffer_size = recv_buffer_size
-        self._sock: Optional[socket.socket] = None
-        self._conn: Optional[socket.socket] = None
-        self._tcp_buffer = b""
-
-    def connect(self) -> None:
-        try:
-            if self.protocol == "udp":
-                self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                self._sock.settimeout(self.timeout)
-                self._sock.bind((self.host, self.port))
-            else:
-                listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                listener.settimeout(self.timeout)
-                listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                listener.bind((self.host, self.port))
-                listener.listen(1)
-                conn, addr = listener.accept()
-                conn.settimeout(self.timeout)
-                listener.close()
-                self._sock = conn
-                self._conn = conn
-                logger.info("Accepted TCP CSI connection from %s", addr)
-        except OSError as exc:
-            raise WiSenseConnectionError(
-                f"Failed to open {self.protocol.upper()} source on "
-                f"{self.host}:{self.port}: {exc}"
-            ) from exc
-        self._connected = True
-        logger.info(
-            "Listening for CSI frames over %s on %s:%d", self.protocol.upper(), self.host, self.port
+    amplitude_matrix = np.asarray(amplitude_matrix, dtype=np.float64)
+    if amplitude_matrix.ndim != 2:
+        raise ValueError(
+            f"amplitude_matrix must be 2-D (n_frames, n_subcarriers), "
+            f"got shape {amplitude_matrix.shape}"
         )
+    n_frames, n_sub = amplitude_matrix.shape
 
-    def disconnect(self) -> None:
-        if self._sock is not None:
-            try:
-                self._sock.close()
-            finally:
-                self._sock = None
-                self._conn = None
-        self._connected = False
+    if method == "mean":
+        return amplitude_matrix.mean(axis=1, keepdims=True)
 
-    def read_frame(self) -> Optional[CSIFrame]:
-        self._require_connected()
-        assert self._sock is not None
-        try:
-            if self.protocol == "udp":
-                data, _addr = self._sock.recvfrom(self.recv_buffer_size)
-                line = data
-            else:
-                line = self._read_tcp_line()
-                if line is None:
-                    return None
-        except socket.timeout:
-            return None
-        except OSError as exc:
-            raise WiSenseConnectionError(f"Network read failed: {exc}") from exc
+    if method == "index":
+        if indices is None:
+            raise ValueError("indices must be provided when method='index'")
+        return amplitude_matrix[:, list(indices)]
 
-        if not line.strip():
-            return None
-        try:
-            return self._parse_json_frame(line)
-        except (json.JSONDecodeError, KeyError, ValueError, TypeError) as exc:
-            raise FrameParseError(f"malformed CSI network frame: {exc}") from exc
+    if method == "variance_topk":
+        if n_frames < 2:
+            # Can't compute meaningful variance from a single frame;
+            # fall back to returning everything unchanged.
+            return amplitude_matrix
+        k = min(top_k, n_sub)
+        variances = amplitude_matrix.var(axis=0)
+        top_indices = np.argsort(variances)[::-1][:k]
+        top_indices.sort()
+        return amplitude_matrix[:, top_indices]
 
-    def _read_tcp_line(self) -> Optional[bytes]:
-        assert self._conn is not None
-        while b"\n" not in self._tcp_buffer:
-            chunk = self._conn.recv(self.recv_buffer_size)
-            if not chunk:
-                return None  # peer closed connection
-            self._tcp_buffer += chunk
-        line, self._tcp_buffer = self._tcp_buffer.split(b"\n", 1)
-        return line
-
-    @staticmethod
-    def _parse_json_frame(raw: bytes) -> CSIFrame:
-        obj = json.loads(raw.decode("utf-8"))
-        timestamp = float(obj["t"])
-        amplitude = np.asarray(obj["amp"], dtype=np.float64)
-        phase = np.asarray(obj["phase"], dtype=np.float64) if obj.get("phase") is not None else None
-        rssi = float(obj["rssi"]) if obj.get("rssi") is not None else None
-        mac = str(obj["mac"]) if obj.get("mac") is not None else None
-        return CSIFrame(timestamp=timestamp, amplitude=amplitude, phase=phase, rssi=rssi, mac=mac)
+    raise ValueError(f"unknown method {method!r}")
 
 
-class FileCSISource(CSISource):
-    """Replays a recorded CSI capture from a CSV file on disk. Useful
-    for tests, demos, and offline development without hardware.
-
-    File format (WiSense CSV capture format)
-    -----------------------------------------
-    One header line, then one row per frame::
-
-        timestamp,rssi,mac,amplitude,phase
-
-    * ``timestamp`` -- float, unix seconds.
-    * ``rssi`` -- float in dBm, or empty for unknown.
-    * ``mac`` -- string, or empty for unknown.
-    * ``amplitude`` -- ``;``-separated list of floats, one per
-      subcarrier (required).
-    * ``phase`` -- ``;``-separated list of floats in radians, same
-      length as ``amplitude``, or empty if phase is unavailable.
-
-    Example row::
-
-        1717000000.100,-42.0,aa:bb:cc:dd:ee:ff,1.02;0.98;1.10,0.01;-0.02;0.03
-
-    Use :func:`write_capture_csv` to produce files in this format from
-    a list of frames (e.g. when recording a live session for later
-    replay).
-    """
-
-    def __init__(self, path: Union[str, Path], loop: bool = False, realtime: bool = False) -> None:
-        super().__init__()
-        self.path = Path(path)
-        self.loop = loop
-        self.realtime = realtime
-        self._fh = None
-        self._header_skipped = False
-        self._last_frame_time: Optional[float] = None
-        self._last_replay_time: Optional[float] = None
-
-    def connect(self) -> None:
-        if not self.path.exists():
-            raise WiSenseConnectionError(f"Capture file not found: {self.path}")
-        try:
-            self._fh = open(self.path, "r", newline="", encoding="utf-8")
-        except OSError as exc:
-            raise WiSenseConnectionError(f"Could not open capture file {self.path}: {exc}") from exc
-        self._connected = True
-        self._header_skipped = False
-        logger.info("Replaying CSI capture from %s (loop=%s)", self.path, self.loop)
-
-    def disconnect(self) -> None:
-        if self._fh is not None:
-            try:
-                self._fh.close()
-            finally:
-                self._fh = None
-        self._connected = False
-
-    def read_frame(self) -> Optional[CSIFrame]:
-        self._require_connected()
-        assert self._fh is not None
-        if not self._header_skipped:
-            self._fh.readline()  # discard header row
-            self._header_skipped = True
-
-        line = self._fh.readline()
-        if not line:
-            if self.loop:
-                self._fh.seek(0)
-                self._header_skipped = False
-                self._last_frame_time = None
-                self._last_replay_time = None
-                return self.read_frame()
-            return None
-
-        line = line.rstrip("\n").rstrip("\r")
-        if not line:
-            return self.read_frame()
-
-        frame = self._parse_csv_row(line)
-
-        if self.realtime:
-            self._pace_realtime(frame.timestamp)
-
-        return frame
-
-    def _pace_realtime(self, frame_timestamp: float) -> None:
-        now = time.monotonic()
-        if self._last_frame_time is not None and self._last_replay_time is not None:
-            delta = frame_timestamp - self._last_frame_time
-            elapsed = now - self._last_replay_time
-            sleep_for = delta - elapsed
-            if sleep_for > 0:
-                time.sleep(sleep_for)
-        self._last_frame_time = frame_timestamp
-        self._last_replay_time = time.monotonic()
-
-    @staticmethod
-    def _parse_csv_row(line: str) -> CSIFrame:
-        parts = line.split(",")
-        if len(parts) != 5:
-            raise FrameParseError(
-                f"expected 5 comma-separated fields (timestamp,rssi,mac,"
-                f"amplitude,phase), got {len(parts)}: {line!r}"
+def frames_to_amplitude_matrix(frames: List[CSIFrame]) -> np.ndarray:
+    """Stack a list of :class:`CSIFrame` amplitude arrays into a single
+    ``(n_frames, n_subcarriers)`` matrix. Raises ``ValueError`` if the
+    frames don't all share the same subcarrier count (e.g. a source
+    changed bandwidth mid-stream). This function stays strict on
+    purpose (callers reading real hardware streams should call
+    :func:`filter_majority_subcarrier_count` first -- see its
+    docstring for why)."""
+    if not frames:
+        return np.empty((0, 0))
+    n_sub = frames[0].n_subcarriers
+    for f in frames:
+        if f.n_subcarriers != n_sub:
+            raise ValueError(
+                "all frames must have the same number of subcarriers to "
+                f"stack into a matrix; got {n_sub} and {f.n_subcarriers}"
             )
-        ts_s, rssi_s, mac_s, amp_s, phase_s = parts
-        try:
-            timestamp = float(ts_s)
-        except ValueError as exc:
-            raise FrameParseError(f"invalid timestamp {ts_s!r}: {exc}") from exc
-
-        rssi = float(rssi_s) if rssi_s.strip() else None
-        mac = mac_s.strip() or None
-
-        if not amp_s.strip():
-            raise FrameParseError("amplitude field is required and cannot be empty")
-        try:
-            amplitude = np.asarray([float(v) for v in amp_s.split(";")], dtype=np.float64)
-        except ValueError as exc:
-            raise FrameParseError(f"invalid amplitude values: {exc}") from exc
-
-        phase = None
-        if phase_s.strip():
-            try:
-                phase = np.asarray([float(v) for v in phase_s.split(";")], dtype=np.float64)
-            except ValueError as exc:
-                raise FrameParseError(f"invalid phase values: {exc}") from exc
-
-        return CSIFrame(timestamp=timestamp, amplitude=amplitude, phase=phase, rssi=rssi, mac=mac)
+    return np.stack([f.amplitude for f in frames], axis=0)
 
 
-def write_capture_csv(path: Union[str, Path], frames: list) -> None:
-    """Write a list of :class:`CSIFrame` objects to disk in the WiSense
-    CSV capture format documented on :class:`FileCSISource`, so they can
-    later be replayed with ``FileCSISource(path)``."""
-    path = Path(path)
-    with open(path, "w", newline="", encoding="utf-8") as fh:
-        fh.write("timestamp,rssi,mac,amplitude,phase\n")
-        for frame in frames:
-            amp_str = ";".join(repr(float(v)) for v in frame.amplitude)
-            phase_str = ";".join(repr(float(v)) for v in frame.phase) if frame.phase is not None else ""
-            rssi_str = "" if frame.rssi is None else repr(float(frame.rssi))
-            mac_str = frame.mac or ""
-            fh.write(f"{frame.timestamp!r},{rssi_str},{mac_str},{amp_str},{phase_str}\n")
+def filter_majority_subcarrier_count(frames: List[CSIFrame]) -> List[CSIFrame]:
+    """Drop any frames whose subcarrier count doesn't match the
+    majority in ``frames``, so a single mixed-bandwidth packet (e.g. a
+    legacy 802.11a/g frame with 52 subcarriers landing among mostly
+    802.11n HT20 frames with 56/64) doesn't crash the whole detection
+    cycle via :func:`frames_to_amplitude_matrix`'s strict shape check.
+
+    On real WiFi hardware, a CSI capture link can see a mix of frame
+    types/bandwidths from ambient traffic; this keeps the majority,
+    consistent-shape frames and silently discards the rest, which is
+    the right behavior for detectors that need a uniform matrix and
+    can tolerate occasionally dropping a handful of frames out of a
+    window, rather than raising and losing the whole window.
+
+    Returns a new list (does not mutate ``frames``). Returns ``frames``
+    unchanged if it is empty or every frame already shares one
+    subcarrier count.
+    """
+    if not frames:
+        return frames
+    counts: dict = {}
+    for f in frames:
+        counts[f.n_subcarriers] = counts.get(f.n_subcarriers, 0) + 1
+    if len(counts) == 1:
+        return frames
+    majority_count = max(counts, key=counts.get)
+    return [f for f in frames if f.n_subcarriers == majority_count]
+
+
+def normalize_frame_amplitude(
+    amplitude_matrix: np.ndarray, method: Literal["mean", "l2"] = "mean", smoothing_window: int = 9
+) -> np.ndarray:
+    """Rescale each frame (each row) of a ``(n_frames, n_subcarriers)``
+    amplitude matrix to compensate for automatic gain control (AGC)
+    gain-state changes between packets, while preserving short,
+    motion-driven transients as the actual sensing signal.
+
+    Why this matters: an ESP32's radio adjusts its LNA/VGA gain
+    per-packet to avoid ADC saturation, and a gain step (a routine,
+    frequent event, not a sensing signal) multiplies a frame's raw CSI
+    amplitude across *all* subcarriers by roughly the same scale
+    factor. Left uncorrected, a sustained gain shift can look similar
+    to the "sudden large amplitude change" signature that
+    :mod:`wisense.fall.detector` and :mod:`wisense.activity.classifier`
+    use to detect real physical events, producing false positives.
+
+    Design choice -- normalize against a *smoothed trend*, not each
+    frame's own value: dividing frame *i* by its own instantaneous
+    magnitude would also partially cancel out genuine motion (a real
+    spike *is* a frame with unusually high magnitude -- dividing it by
+    itself suppresses exactly the signal being measured). Instead, each
+    frame is divided by a moving average of the per-frame magnitude
+    series (see ``smoothing_window``), which tracks slow, sustained
+    scale drift (matching how AGC actually behaves -- it settles and
+    holds a gain level for many packets) without reacting to a single
+    frame's brief spike.
+
+    Important limitation -- read before relying on this: this is a
+    **partial mitigation, not a full AGC correction**. ESP32-CSI-Tool's
+    packet format does not expose the actual LNA/VGA gain state used
+    for each packet, only the resulting CSI values, so there is no way
+    to invert the true gain applied -- this can only *estimate and
+    smooth out* a sustained multiplicative scale drift between frames,
+    which is not exactly the same thing as the actual AGC transfer
+    function. It also cannot help at all with within-frame
+    (subcarrier-to-subcarrier) effects, and an AGC step that happens to
+    coincide with genuine fast motion cannot be distinguished from that
+    motion by this function alone. Treat this as reducing, not
+    eliminating, AGC-driven false positives.
+
+    Parameters
+    ----------
+    amplitude_matrix: shape ``(n_frames, n_subcarriers)``.
+    method:
+        ``"mean"`` uses each frame's own mean amplitude as its raw
+        magnitude (fast, robust to a handful of outlier subcarriers).
+        ``"l2"`` uses the frame's L2 norm instead (more standard in
+        some CSI preprocessing literature, more sensitive to outliers).
+    smoothing_window:
+        Window size (in frames) for the moving average applied to the
+        per-frame magnitude series before it's used as the
+        normalization reference. Larger values track slower drift
+        without touching short spikes; smaller values react faster but
+        risk suppressing motion transients (as with per-frame
+        normalization at the extreme of ``smoothing_window=1``).
+
+    Returns
+    -------
+    A new array, same shape as input. Frames whose reference magnitude
+    is (near-)zero are left unscaled rather than dividing by zero.
+    """
+    amplitude_matrix = np.asarray(amplitude_matrix, dtype=np.float64)
+    if amplitude_matrix.ndim != 2:
+        raise ValueError(
+            f"amplitude_matrix must be 2-D (n_frames, n_subcarriers), "
+            f"got shape {amplitude_matrix.shape}"
+        )
+    n_frames = amplitude_matrix.shape[0]
+    if n_frames == 0:
+        return amplitude_matrix.copy()
+
+    if method == "mean":
+        per_frame_scale = amplitude_matrix.mean(axis=1)
+    elif method == "l2":
+        per_frame_scale = np.linalg.norm(amplitude_matrix, axis=1)
+    else:
+        raise ValueError(f"method must be 'mean' or 'l2', got {method!r}")
+
+    if n_frames >= 3 and smoothing_window > 1:
+        reference_scale = moving_average_filter(
+            per_frame_scale, window_size=min(smoothing_window, n_frames), mode="centered"
+        )
+    else:
+        # Too few frames to smooth meaningfully -- fall back to the
+        # matrix's overall average as a single flat reference, which at
+        # least avoids the self-cancellation problem described above.
+        reference_scale = np.full(n_frames, float(per_frame_scale.mean()))
+
+    overall_scale = (
+        float(np.mean(per_frame_scale[per_frame_scale > 1e-9]))
+        if np.any(per_frame_scale > 1e-9)
+        else 1.0
+    )
+    safe_scale = np.where(reference_scale > 1e-9, reference_scale, 1.0)
+    normalized = amplitude_matrix / safe_scale[:, np.newaxis] * overall_scale
+    return normalized
