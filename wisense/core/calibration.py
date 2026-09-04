@@ -19,7 +19,7 @@ from typing import Optional
 import numpy as np
 
 from wisense.core.connection import CSISource
-from wisense.core.filters import frames_to_amplitude_matrix
+from wisense.core.filters import filter_majority_subcarrier_count, frames_to_amplitude_matrix, normalize_frame_amplitude
 from wisense.exceptions import CalibrationError
 
 logger = logging.getLogger("wisense.core.calibration")
@@ -77,7 +77,9 @@ class CalibrationProfile:
         return self.baseline_variance_p95 + n_sigmas * spread
 
 
-def calibrate(source: CSISource, duration_seconds: float = 30.0) -> CalibrationProfile:
+def calibrate(
+    source: CSISource, duration_seconds: float = 30.0, idle_timeout_seconds: float = 3.0
+) -> CalibrationProfile:
     """Collect a baseline from ``source`` for ``duration_seconds`` and
     return a :class:`CalibrationProfile`.
 
@@ -86,6 +88,19 @@ def calibrate(source: CSISource, duration_seconds: float = 30.0) -> CalibrationP
     ``with source:`` blocks and with sources already in use elsewhere).
     Intended to be run while the monitored space is in a known,
     typically unoccupied, state.
+
+    Parameters
+    ----------
+    source: an already-connected CSISource.
+    duration_seconds: total wall-clock window to collect a baseline over.
+    idle_timeout_seconds:
+        If no frame has been received for this long (tracked from the
+        *last successfully received frame*, not from the start of
+        calibration), stop early rather than waiting out the full
+        ``duration_seconds``. This matters on real serial/network links,
+        where momentary gaps between individual frames are normal and
+        must not be confused with the source having gone silent for
+        good -- only a *sustained* gap this long ends calibration early.
 
     Raises
     ------
@@ -102,22 +117,28 @@ def calibrate(source: CSISource, duration_seconds: float = 30.0) -> CalibrationP
     """
     if duration_seconds <= 0:
         raise ValueError("duration_seconds must be positive")
+    if idle_timeout_seconds <= 0:
+        raise ValueError("idle_timeout_seconds must be positive")
 
     frames = []
     start = time.monotonic()
     deadline = start + duration_seconds
+    last_frame_at = start
     while time.monotonic() < deadline:
         frame = source.read_frame()
         if frame is None:
             # For file sources this means end-of-file; for live sources
-            # it means "nothing available right now" -- either way, stop
-            # trying once we've clearly stopped receiving new data for a
-            # full timeout cycle, but don't error immediately, since a
-            # live source may just be momentarily quiet.
-            if frames and (time.monotonic() - start) > 0.5:
+            # it means "nothing available right now" -- a momentary gap
+            # is normal (serial/network jitter) and must not end
+            # calibration on its own. Only a *sustained* gap -- no frame
+            # received for idle_timeout_seconds, measured from the last
+            # frame we actually got -- means the source has genuinely
+            # gone quiet.
+            if frames and (time.monotonic() - last_frame_at) > idle_timeout_seconds:
                 break
             continue
         frames.append(frame)
+        last_frame_at = time.monotonic()
 
     if len(frames) < _MIN_CALIBRATION_FRAMES:
         raise CalibrationError(
@@ -127,7 +148,23 @@ def calibrate(source: CSISource, duration_seconds: float = 30.0) -> CalibrationP
             "and actively producing frames."
         )
 
+    # Drop any stray mixed-bandwidth frames before stacking into a
+    # matrix (see filter_majority_subcarrier_count docstring), then
+    # apply the same per-frame AGC-mitigation normalization used at
+    # detection time -- calibration thresholds must be computed in the
+    # same normalized space detectors will compare live data against,
+    # or the threshold is calibrated against the wrong scale.
+    frames = filter_majority_subcarrier_count(frames)
+    if len(frames) < _MIN_CALIBRATION_FRAMES:
+        raise CalibrationError(
+            f"only {len(frames)} frames remained after discarding "
+            "mixed-bandwidth outliers; need at least "
+            f"{_MIN_CALIBRATION_FRAMES}. This can happen if the capture "
+            "environment has heavy mixed-bandwidth WiFi traffic."
+        )
+
     matrix = frames_to_amplitude_matrix(frames)  # (n_frames, n_subcarriers)
+    matrix = normalize_frame_amplitude(matrix)
     baseline_mean = matrix.mean(axis=0)
     baseline_std = matrix.std(axis=0)
     per_subcarrier_variance = matrix.var(axis=0)

@@ -5,9 +5,11 @@ from wisense.core.connection import CSIFrame
 from wisense.core.filters import (
     amplitude_phase,
     butterworth_lowpass_filter,
+    filter_majority_subcarrier_count,
     frames_to_amplitude_matrix,
     hampel_filter,
     moving_average_filter,
+    normalize_frame_amplitude,
     select_subcarriers,
 )
 
@@ -127,3 +129,77 @@ def test_frames_to_amplitude_matrix_rejects_inconsistent_subcarriers():
 def test_frames_to_amplitude_matrix_empty():
     matrix = frames_to_amplitude_matrix([])
     assert matrix.shape == (0, 0)
+
+
+def test_normalize_frame_amplitude_corrects_sustained_agc_step():
+    # Simulate a sustained AGC gain step: 20 frames at baseline scale,
+    # then 20 frames scaled up 3x (as a real AGC gain jump would
+    # multiply all subcarriers by roughly the same factor), no
+    # motion-driven variance within either segment.
+    rng = np.random.default_rng(0)
+    baseline = 10.0 + rng.normal(0, 0.05, size=(20, 8))
+    gain_stepped = 3.0 * (10.0 + rng.normal(0, 0.05, size=(20, 8)))
+    matrix = np.vstack([baseline, gain_stepped])
+
+    raw_variance = matrix.mean(axis=1).var()
+    normalized = normalize_frame_amplitude(matrix, smoothing_window=9)
+    normalized_variance = normalized.mean(axis=1).var()
+
+    # The AGC step should dominate raw per-frame-mean variance; after
+    # normalization, that dominance should be substantially reduced.
+    assert normalized_variance < raw_variance * 0.5
+
+
+def test_normalize_frame_amplitude_preserves_short_spike():
+    # A brief, motion-like spike (a handful of frames) should NOT be
+    # cancelled out the way a sustained AGC step is -- this is the
+    # whole point of smoothing against a trend rather than each
+    # frame's own instantaneous value.
+    rng = np.random.default_rng(1)
+    quiet_before = 10.0 + rng.normal(0, 0.05, size=(15, 8))
+    spike = np.full((2, 8), 25.0) + rng.normal(0, 0.05, size=(2, 8))
+    quiet_after = 10.0 + rng.normal(0, 0.05, size=(15, 8))
+    matrix = np.vstack([quiet_before, spike, quiet_after])
+
+    normalized = normalize_frame_amplitude(matrix, smoothing_window=9)
+    normalized_signal = normalized.mean(axis=1)
+
+    # The spike frames should still clearly stand out from the quiet
+    # baseline after normalization -- i.e. normalization corrected
+    # sustained drift, not this transient.
+    spike_level = normalized_signal[15:17].mean()
+    baseline_level = np.concatenate([normalized_signal[:15], normalized_signal[17:]]).mean()
+    assert spike_level > baseline_level * 1.5
+
+
+def test_normalize_frame_amplitude_rejects_1d_input():
+    with pytest.raises(ValueError):
+        normalize_frame_amplitude(np.array([1.0, 2.0, 3.0]))
+
+
+def test_normalize_frame_amplitude_empty():
+    result = normalize_frame_amplitude(np.empty((0, 4)))
+    assert result.shape == (0, 4)
+
+
+def test_normalize_frame_amplitude_invalid_method():
+    with pytest.raises(ValueError):
+        normalize_frame_amplitude(np.ones((5, 4)), method="bogus")
+
+
+def test_filter_majority_subcarrier_count_drops_minority():
+    frames = [CSIFrame(timestamp=float(i), amplitude=np.zeros(8)) for i in range(10)]
+    frames += [CSIFrame(timestamp=100.0, amplitude=np.zeros(6))]  # one stray mixed-bandwidth frame
+    filtered = filter_majority_subcarrier_count(frames)
+    assert len(filtered) == 10
+    assert all(f.n_subcarriers == 8 for f in filtered)
+
+
+def test_filter_majority_subcarrier_count_all_consistent_unchanged():
+    frames = [CSIFrame(timestamp=float(i), amplitude=np.zeros(8)) for i in range(5)]
+    filtered = filter_majority_subcarrier_count(frames)
+    assert filtered == frames
+
+
+def test_filter_majority_subcarrier_count_empty():
+    assert filter_majority_subcarrier_count([]) == []

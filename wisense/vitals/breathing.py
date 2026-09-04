@@ -14,6 +14,26 @@ instead of a fabricated number whenever the window is too short or the
 signal-to-noise ratio in the respiration band is too low to support a
 confident estimate -- see the ``Returns`` section of
 :func:`estimate_breathing_rate`.
+
+Hardware sensitivity caveat -- read before relying on this on an
+ESP32
+-----------------------------------------------------------------
+Breathing-induced chest movement perturbs 2.4 GHz CSI amplitude far
+less than gross body motion does (this is *why* the SNR gate exists at
+all). Published CSI respiration-sensing results generally come from
+more capable radios/antenna setups than a single commodity ESP32, and
+this module's SNR threshold was tuned against clean synthetic sine
+waves (see ``tests/vitals/test_breathing.py``), not a validated
+real-world noise floor -- nobody has run this against a real ESP32 to
+confirm what fraction of real attempts clear the SNR gate at typical
+room distances. It is entirely plausible that, on real hardware, this
+returns ``None`` far more often than the synthetic tests suggest,
+particularly beyond a meter or two, through obstacles, or with a noisy
+RF environment. Conversely, claiming it will *never* produce a
+confident reading is also not something this project can verify one
+way or the other without real-hardware testing. Treat any real-world
+result -- confident estimate or ``None`` -- as data worth reporting via
+an issue, not an established, benchmarked capability.
 """
 
 from __future__ import annotations
@@ -24,7 +44,7 @@ from typing import List, Optional
 import numpy as np
 
 from wisense.core.connection import CSIFrame
-from wisense.core.filters import frames_to_amplitude_matrix, select_subcarriers
+from wisense.core.filters import filter_majority_subcarrier_count, frames_to_amplitude_matrix, normalize_frame_amplitude, select_subcarriers
 
 logger = logging.getLogger("wisense.vitals.breathing")
 
@@ -75,6 +95,11 @@ def estimate_breathing_rate(
     if sample_rate_hz <= 0:
         raise ValueError("sample_rate_hz must be positive")
 
+    # Drop stray mixed-bandwidth frames before anything else, so the
+    # duration/frame-count check below reflects what will actually be
+    # analyzed.
+    frame_window = filter_majority_subcarrier_count(frame_window)
+
     n_frames = len(frame_window)
     duration_s = n_frames / sample_rate_hz
     min_duration_s = _MIN_CYCLES_REQUIRED / RESPIRATION_BAND_HZ[0]
@@ -91,6 +116,7 @@ def estimate_breathing_rate(
         return None
 
     matrix = frames_to_amplitude_matrix(frame_window)
+    matrix = normalize_frame_amplitude(matrix)  # mitigate AGC gain-step artifacts -- see docstring
     reduced = select_subcarriers(matrix, method="variance_topk", top_k=subcarrier_top_k)
     signal = reduced.mean(axis=1)
 

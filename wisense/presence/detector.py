@@ -32,7 +32,7 @@ import numpy as np
 
 from wisense.core.calibration import CalibrationProfile
 from wisense.core.connection import CSIFrame
-from wisense.core.filters import frames_to_amplitude_matrix, select_subcarriers
+from wisense.core.filters import filter_majority_subcarrier_count, frames_to_amplitude_matrix, normalize_frame_amplitude, select_subcarriers
 from wisense.exceptions import InsufficientSignalError
 from wisense.models.registry import ModelRegistry, get_default_registry
 
@@ -152,7 +152,18 @@ class PresenceDetector:
         calibration: Optional[CalibrationProfile],
         timestamp: float,
     ) -> PresenceResult:
+        # Drop any stray mixed-bandwidth frames before stacking into a
+        # matrix (real hardware can see a mix of frame types on the
+        # link -- see filter_majority_subcarrier_count docstring).
+        frame_window = filter_majority_subcarrier_count(frame_window)
+        if len(frame_window) < _MIN_FRAMES:
+            raise InsufficientSignalError(
+                f"PresenceDetector.detect requires at least {_MIN_FRAMES} frames "
+                "after discarding mixed-bandwidth outliers, got "
+                f"{len(frame_window)}"
+            )
         matrix = frames_to_amplitude_matrix(frame_window)  # (n_frames, n_sub)
+        matrix = normalize_frame_amplitude(matrix)
         reduced = select_subcarriers(matrix, method="variance_topk", top_k=self.variance_top_k)
         metric = float(reduced.var(axis=0).mean())
 

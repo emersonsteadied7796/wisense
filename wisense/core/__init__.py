@@ -14,8 +14,10 @@ from wisense.core.calibration import CalibrationProfile, calibrate
 from wisense.core.filters import (
     amplitude_phase,
     butterworth_lowpass_filter,
+    filter_majority_subcarrier_count,
     hampel_filter,
     moving_average_filter,
+    normalize_frame_amplitude,
     select_subcarriers,
 )
 from wisense.core.events import EventEmitter, Monitor, StreamWorker
@@ -31,8 +33,10 @@ __all__ = [
     "calibrate",
     "amplitude_phase",
     "butterworth_lowpass_filter",
+    "filter_majority_subcarrier_count",
     "hampel_filter",
     "moving_average_filter",
+    "normalize_frame_amplitude",
     "select_subcarriers",
     "EventEmitter",
     "Monitor",

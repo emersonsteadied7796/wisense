@@ -98,7 +98,8 @@ def test_serial_parse_esp32_csi_tool_line():
     header_fields = ["CSI_DATA", "0", "aa:bb:cc:dd:ee:ff", "-45", "1", "1", "0", "1", "0", "0", "0", "0", "0", "0", "-90", "0", "6", "0", "123456", "0", "128", "0", "10"]
     csi_values = "[1 2 -1 3 0 4]"  # 3 subcarriers: (imag,real) pairs
     line = ",".join(header_fields) + "," + csi_values
-    frame = SerialCSISource._parse_esp32_csi_tool_line(line)
+    source = SerialCSISource(port="/dev/null")
+    frame = source._parse_esp32_csi_tool_line(line)
     assert frame.n_subcarriers == 3
     assert frame.rssi == -45.0
     assert frame.mac == "aa:bb:cc:dd:ee:ff"
@@ -106,16 +107,50 @@ def test_serial_parse_esp32_csi_tool_line():
     assert frame.amplitude[0] == pytest.approx((1**2 + 2**2) ** 0.5)
 
 
+def test_serial_parse_establishes_wall_clock_offset_from_first_frame():
+    header_fields = ["CSI_DATA", "0", "aa:bb:cc:dd:ee:ff", "-45", "1", "1", "0", "1", "0", "0", "0", "0", "0", "0", "-90", "0", "6", "0", "1000000", "0", "128", "0", "10"]
+    line1 = ",".join(header_fields) + ",[1 2]"
+    header_fields2 = list(header_fields)
+    header_fields2[18] = "1500000"  # +0.5s of hardware time later
+    line2 = ",".join(header_fields2) + ",[1 2]"
+
+    source = SerialCSISource(port="/dev/null")
+    f1 = source._parse_esp32_csi_tool_line(line1)
+    f2 = source._parse_esp32_csi_tool_line(line2)
+    # Frame-to-frame spacing should track the *hardware* clock delta
+    # (0.5s) regardless of how much wall-clock time actually elapsed
+    # between the two Python calls.
+    assert f2.timestamp - f1.timestamp == pytest.approx(0.5, abs=1e-6)
+
+
+def test_serial_target_mac_filters_other_transmitters():
+    header_fields = ["CSI_DATA", "0", "aa:bb:cc:dd:ee:ff", "-45", "1", "1", "0", "1", "0", "0", "0", "0", "0", "0", "-90", "0", "6", "0", "123456", "0", "128", "0", "10"]
+    other_mac_fields = list(header_fields)
+    other_mac_fields[2] = "11:22:33:44:55:66"
+    line_other = ",".join(other_mac_fields) + ",[1 2]"
+    line_target = ",".join(header_fields) + ",[1 2]"
+
+    source = SerialCSISource(port="/dev/null", target_mac="AA:BB:CC:DD:EE:FF")
+    # Parsing itself doesn't filter -- filtering happens in read_frame().
+    # Directly verify the filtering condition matches what read_frame() uses:
+    frame_other = source._parse_esp32_csi_tool_line(line_other)
+    frame_target = source._parse_esp32_csi_tool_line(line_target)
+    assert frame_other.mac.lower() != source.target_mac
+    assert frame_target.mac.lower() == source.target_mac
+
+
 def test_serial_parse_rejects_too_few_header_fields():
+    source = SerialCSISource(port="/dev/null")
     with pytest.raises(FrameParseError):
-        SerialCSISource._parse_esp32_csi_tool_line("CSI_DATA,0,1 [1 2]")
+        source._parse_esp32_csi_tool_line("CSI_DATA,0,1 [1 2]")
 
 
 def test_serial_parse_rejects_odd_length_csi_array():
     header_fields = ["CSI_DATA"] + ["0"] * 22
     line = ",".join(header_fields) + ",[1 2 3]"
+    source = SerialCSISource(port="/dev/null")
     with pytest.raises(FrameParseError):
-        SerialCSISource._parse_esp32_csi_tool_line(line)
+        source._parse_esp32_csi_tool_line(line)
 
 
 def _free_udp_port() -> int:

@@ -32,6 +32,22 @@ people move in synchrony (their dominant frequencies collapse into one
 cluster, undercounting). Treat the return value as a coarse estimate,
 not a reliable exact count, and validate against your specific
 environment before relying on it.
+
+A specific physical objection worth addressing directly: in
+single-antenna, single-link WiFi, all subcarriers physically pass
+through the *same* space and reflect off *all* occupants at once --
+splitting subcarriers into groups is a frequency-domain split, not a
+spatial one, and does not give each group a physically separate view
+of the room the way multiple antennas or receivers would. The
+underlying assumption here -- that different subcarrier groups end up
+dominated by different movers' frequency signatures often enough to
+be useful -- is a heuristic, not a guaranteed spatial separation, and
+it can fail in exactly the ways described above. It has not been
+validated against real multi-occupant hardware captures. If it turns
+out to perform no better than chance in practice, the honest fix is to
+narrow this function's scope down to presence/no-presence rather than
+attempting a count, and that's on the table depending on what testing
+shows.
 """
 
 from __future__ import annotations
@@ -43,7 +59,7 @@ import numpy as np
 
 from wisense.core.calibration import CalibrationProfile
 from wisense.core.connection import CSIFrame
-from wisense.core.filters import frames_to_amplitude_matrix
+from wisense.core.filters import filter_majority_subcarrier_count, frames_to_amplitude_matrix, normalize_frame_amplitude
 from wisense.exceptions import InsufficientSignalError
 
 logger = logging.getLogger("wisense.people.counter")
@@ -98,7 +114,15 @@ def count_occupants(
             f"count_occupants requires at least {_MIN_FRAMES} frames, got {len(frame_window)}"
         )
 
+    frame_window = filter_majority_subcarrier_count(frame_window)
+    if len(frame_window) < _MIN_FRAMES:
+        raise InsufficientSignalError(
+            f"count_occupants requires at least {_MIN_FRAMES} frames after "
+            f"discarding mixed-bandwidth outliers, got {len(frame_window)}"
+        )
+
     matrix = frames_to_amplitude_matrix(frame_window)  # (n_frames, n_sub)
+    matrix = normalize_frame_amplitude(matrix)  # mitigate AGC gain jumps -- see docstring
     n_frames, n_sub = matrix.shape
     n_groups = min(n_groups, n_sub)
 

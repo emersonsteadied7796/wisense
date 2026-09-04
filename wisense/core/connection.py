@@ -58,6 +58,24 @@ class CSIFrame:
         ``(n_subcarriers,)``. May be ``None`` if the source cannot
         provide phase (some cheap capture pipelines only expose
         amplitude).
+
+        **No statistical-baseline detector in this library currently
+        reads this field.** Every detection module (presence, fall,
+        activity, breathing, people) operates on amplitude only. This
+        is deliberate, not an oversight: commodity WiFi radios like the
+        ESP32 suffer from carrier/sampling frequency offset and packet
+        detection delay severe enough that raw per-packet phase rotates
+        essentially randomly across ``[-pi, +pi]`` without proper
+        sanitization (linear unwrapping alone, as done in
+        :func:`wisense.core.filters.amplitude_phase`, is not
+        sufficient -- real phase-based sensing needs per-link
+        calibration or a multi-antenna reference to cancel these
+        offsets, which this library does not implement). ``phase`` is
+        still parsed and exposed here for advanced users who want to
+        implement their own phase-based processing, or as an input
+        feature to a custom-trained ONNX model, but treat it as raw,
+        uncalibrated data -- not something safe to threshold on
+        directly the way amplitude is.
     rssi:
         Received signal strength indicator in dBm, if the source
         reports one. ``None`` if unavailable.
@@ -178,16 +196,52 @@ class SerialCSISource(CSISource):
     serial port) are skipped rather than raising, since that is normal,
     expected traffic on this link.
 
+    Multiple transmitters on the same link
+    ---------------------------------------
+    An ESP32 running in CSI-sniffing mode can report packets from
+    *every* nearby WiFi transmitter it overhears -- your router, other
+    people's routers, phones, IoT devices -- not just one. Mixing CSI
+    from different transmitters into one time series is meaningless:
+    each has its own distance, transmit power, and antenna geometry, so
+    amplitude "variance" between two frames from two different
+    transmitters reflects who's transmitting, not whether someone moved.
+    Pass ``target_mac`` to keep only frames from one specific
+    transmitter (e.g. your own router's BSSID) and silently discard the
+    rest.
+
+    Hardware timestamps
+    --------------------
+    The firmware reports ``local_timestamp`` as microseconds since the
+    ESP32's own boot, not wall-clock time. USB-to-UART bridges commonly
+    deliver serial data in bursts (they buffer for their own USB polling
+    interval rather than delivering byte-by-byte), so using
+    ``time.time()`` at Python receipt time for every frame introduces
+    burst jitter that corrupts time-sensitive analysis like the FFT in
+    :func:`wisense.vitals.breathing.estimate_breathing_rate`. To avoid
+    this, this class establishes a wall-clock offset from the *first*
+    frame it sees (``offset = time.time() - local_timestamp_seconds``)
+    and applies that same offset to every subsequent frame's hardware
+    timestamp, so frame-to-frame spacing reflects the firmware's own
+    microsecond-accurate clock rather than USB delivery jitter.
+
     Requires ``pyserial`` (``pip install wisense`` pulls it in as a core
     dependency since it is required for this source).
     """
 
-    def __init__(self, port: str, baudrate: int = 921600, timeout: float = 2.0) -> None:
+    def __init__(
+        self,
+        port: str,
+        baudrate: int = 921600,
+        timeout: float = 2.0,
+        target_mac: Optional[str] = None,
+    ) -> None:
         super().__init__()
         self.port = port
         self.baudrate = baudrate
         self.timeout = timeout
+        self.target_mac = target_mac.lower() if target_mac else None
         self._serial = None  # type: ignore[assignment]
+        self._time_offset: Optional[float] = None
 
     def connect(self) -> None:
         try:
@@ -234,19 +288,29 @@ class SerialCSISource(CSISource):
                 # Firmware debug/log output sharing the same UART.
                 continue
             try:
-                return self._parse_esp32_csi_tool_line(line)
+                frame = self._parse_esp32_csi_tool_line(line)
             except FrameParseError as exc:
                 logger.warning("Discarding malformed CSI_DATA line: %s", exc)
                 continue
+            if self.target_mac is not None and (frame.mac is None or frame.mac.lower() != self.target_mac):
+                # Frame from a different transmitter than the one we've
+                # been asked to track -- see class docstring on why
+                # mixing these is meaningless for sensing.
+                continue
+            return frame
 
-    @staticmethod
-    def _parse_esp32_csi_tool_line(line: str) -> CSIFrame:
+    def _parse_esp32_csi_tool_line(self, line: str) -> CSIFrame:
         """Parse one ``CSI_DATA,...`` line as emitted by ESP32-CSI-Tool.
 
         See the class docstring for the field layout. Raises
         :class:`FrameParseError` if the line does not have the expected
         number of comma-separated fields or the CSI array cannot be
         parsed as an even-length list of int8 values.
+
+        Instance method (not static) because it maintains
+        ``self._time_offset`` to translate the firmware's
+        boot-relative microsecond clock into wall-clock time -- see the
+        "Hardware timestamps" section of the class docstring.
         """
         # The CSI array field is itself comma-free (space separated,
         # bracket delimited), but it may contain the delimiter used by
@@ -295,13 +359,19 @@ class SerialCSISource(CSISource):
         phase = np.arctan2(imag, real)
 
         # local_timestamp from the firmware is microseconds since boot,
-        # not wall-clock time, so fall back to wall-clock receipt time
-        # for `timestamp`, which is what downstream buffering/rate
-        # calculations rely on. The raw device timestamp is not
-        # currently exposed further; a future version could expose it
-        # separately for jitter analysis.
+        # not wall-clock time. Establish a wall-clock offset from the
+        # first frame seen, then apply that same offset to every
+        # subsequent frame's hardware timestamp -- this preserves the
+        # firmware's own microsecond-accurate inter-frame spacing
+        # instead of using USB-burst-jittery Python receipt time. See
+        # the "Hardware timestamps" section of the class docstring.
+        local_timestamp_s = local_timestamp_us / 1_000_000.0
+        if self._time_offset is None:
+            self._time_offset = time.time() - local_timestamp_s
+        timestamp = self._time_offset + local_timestamp_s
+
         return CSIFrame(
-            timestamp=time.time(),
+            timestamp=timestamp,
             amplitude=amplitude,
             phase=phase,
             rssi=rssi,

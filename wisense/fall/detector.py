@@ -43,7 +43,7 @@ import numpy as np
 
 from wisense.core.calibration import CalibrationProfile
 from wisense.core.connection import CSIFrame
-from wisense.core.filters import frames_to_amplitude_matrix, select_subcarriers
+from wisense.core.filters import filter_majority_subcarrier_count, frames_to_amplitude_matrix, normalize_frame_amplitude, select_subcarriers
 from wisense.exceptions import InsufficientSignalError
 from wisense.models.registry import ModelRegistry, get_default_registry
 
@@ -151,7 +151,17 @@ class FallDetector:
     def _detect_statistical(
         self, frame_window: List[CSIFrame], calibration: Optional[CalibrationProfile]
     ) -> Optional[FallEvent]:
+        # Drop stray mixed-bandwidth frames first (see
+        # filter_majority_subcarrier_count docstring); re-check the
+        # minimum frame count since filtering can shrink the window.
+        frame_window = filter_majority_subcarrier_count(frame_window)
+        if len(frame_window) < _MIN_FRAMES:
+            raise InsufficientSignalError(
+                f"FallDetector.detect requires at least {_MIN_FRAMES} frames "
+                f"after discarding mixed-bandwidth outliers, got {len(frame_window)}"
+            )
         matrix = frames_to_amplitude_matrix(frame_window)
+        matrix = normalize_frame_amplitude(matrix)  # mitigate AGC gain jumps -- see docstring
         reduced = select_subcarriers(matrix, method="variance_topk", top_k=self.variance_top_k)
         signal = reduced.mean(axis=1)  # (n_frames,) aggregate amplitude series
         diffs = np.diff(signal)

@@ -39,6 +39,23 @@ thing you can contribute right now. Please open an issue with your
 board model, firmware version, and, if possible, a short capture file
 reproducing the problem.
 
+**On real-world RF conditions specifically:** a detailed code review
+(credited in [CHANGELOG.md](CHANGELOG.md)) surfaced several real bugs
+around calibration timing, mixed-transmitter interference, and
+hardware timestamp handling, all fixed as of this version -- and one
+inherent limitation that's mitigated but not fully solved: commodity
+WiFi radios like the ESP32 apply automatic gain control (AGC) per
+packet, which can look similar to genuine motion to a naive
+variance-based detector. `normalize_frame_amplitude` (see
+`wisense/core/filters.py`) partially compensates for this, but a full
+correction isn't possible from the data ESP32-CSI-Tool's packet format
+exposes. Breathing-rate and multi-person-counting are the two
+statistical baselines most likely to be affected by real-world RF
+conditions in ways the synthetic test suite can't fully capture --
+their module docstrings spell out exactly why and what "it doesn't
+work well" would look like, so a bug report can be specific rather
+than just "this doesn't work."
+
 ## Install
 
 ```bash
